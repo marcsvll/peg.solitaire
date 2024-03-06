@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -7,87 +8,85 @@ use tokio::{
     sync::broadcast,
 };
 
-#[derive(Clone, Debug)]
-enum ServerMessage {
-    ChatMessage(String),
-    BoardUpdate(String),
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Server failed to run: {}", e);
+        std::process::exit(1);
+    }
 }
-
 #[derive(Clone)]
 struct User {
     name: String,
     _id: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let listener = TcpListener::bind("localhost:8080").await?;
-    let (tx, _rx) = broadcast::channel::<ServerMessage>(10);
+pub async fn run() -> Result<()> {
+    let listener = TcpListener::bind("localhost:8080").await.unwrap();
+    let (tx, _rx) = broadcast::channel(15);
     let user_map: Arc<Mutex<HashMap<String, User>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    println!("Server running on localhost:8080");
-
+    println!("Starting server");
     loop {
         let (mut socket, addr) = listener.accept().await?;
+
+        let user_map_clone = user_map.clone();
         let tx = tx.clone();
         let mut rx = tx.subscribe();
-        let user_map = user_map.clone();
 
         tokio::spawn(async move {
             let (reader, mut writer) = socket.split();
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
 
-            // Ler a primeira linha para o nome de usuário
-            if reader.read_line(&mut line).await? == 0 {
-                return Ok::<(), anyhow::Error>(());
+            let bytes_read = reader.read_line(&mut line).await.unwrap();
+            if bytes_read == 0 {
+                return;
             }
-
-            let username = line.trim().to_string(); // Extrai o nome de usuário
-            let user = User { name: username.clone(), _id: addr.to_string() };
-            user_map.lock().unwrap().insert(addr.to_string(), user.clone());
+            let username = line.split("username:").collect::<Vec<&str>>()[1]
+                .trim()
+                .to_string();
+            let user_id = addr.to_string();
+            let user = User {
+                name: username.clone(),
+                _id: user_id.clone(),
+            };
+            user_map_clone.lock().unwrap().insert(user_id.clone(), user);
             println!("{} connected", username);
-            line.clear(); // Limpa a linha para as próximas leituras
+
+            let success_message = format!("Welcome to the chat, {username}!\n",);
+            writer.write_all(success_message.as_bytes()).await.unwrap();
+            line.clear();
 
             loop {
                 tokio::select! {
                     result = reader.read_line(&mut line) => {
-                        let line = line.trim();
-                        if result.unwrap() == 0 || line.is_empty() {
-                            println!("{} disconnected", username);
+                        if result.unwrap() == 0 {
                             break;
                         }
+                        if !line.trim().is_empty() {
 
-                        if line.starts_with("move") {
-                            let board_update = line.to_string(); // Simplificação para o exemplo
-                            tx.send(ServerMessage::BoardUpdate(board_update)).unwrap();
-                        } else {
-                            let chat_message = format!("{}: {}", user.name, line);
-                            tx.send(ServerMessage::ChatMessage(chat_message)).unwrap();
+                            let user_name = {
+                                let user_map_guard = user_map_clone.lock().unwrap();
+                                if let Some(user) = user_map_guard.get(&user_id) {
+                                    user.name.clone()
+                                } else {
+                                    eprintln!("User not found for ID: {}", user_id);
+                                    continue;
+                                }
+                            };
+                            let msg = format!("{}: {}", user_name, line.clone());
+                            tx.send((msg, addr)).unwrap();
                         }
+                        line.clear();
                     },
                     result = rx.recv() => {
-                        match result.unwrap() {
-                            ServerMessage::ChatMessage(msg) => {
-                                if let Err(e) = writer.write_all(msg.as_bytes()).await {
-                                    eprintln!("Error sending message to {}: {}", username, e);
-                                    break;
-                                }
-                            },
-                            ServerMessage::BoardUpdate(board_state) => {
-                                if let Err(e) = writer.write_all(board_state.as_bytes()).await {
-                                    eprintln!("Error sending board update to {}: {}", username, e);
-                                    break;
-                                }
-                            },
-                        }
+                        let (msg, _other_addr) = result.unwrap();
+
+                        writer.write_all(msg.as_bytes()).await.unwrap();
+
                     },
                 }
             }
-
-            // Remove o usuário do mapa de usuários quando ele se desconecta
-            user_map.lock().unwrap().remove(&addr.to_string());
-            Ok(())
         });
     }
 }
